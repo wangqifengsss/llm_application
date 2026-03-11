@@ -1,5 +1,5 @@
 # 第1、2、3天的代码（保留，无需修改，新增千问模型相关配置）
-from fastapi import FastAPI
+from fastapi import FastAPI, Query,Body
 from pydantic import BaseModel
 import requests
 from openai import OpenAI  # 千问模型兼容openai库，无需额外导入
@@ -52,9 +52,11 @@ def call_qwen_model(question: str, history: list, token: str) -> dict:
             error_msg = f"【未知错误】模型调用失败：{error_msg[:100]}"  # 截取前100字符，避免冗余
         return {"status": "error", "answer": error_msg}
 
+# 修改FastAPI实例，添加全局文档注释（衔接第4天代码）
 app = FastAPI(
-    title="大模型应用开发接口",
-    version="1.0"
+    title="LLM应用接口文档",
+    description="大模型应用开发工程师带教学习（第6天），包含千问模型调用、多轮对话优化等接口，适配Qwen/Qwen3.5-35B-A3B模型",
+    version="1.0.0"
 )
 
 # 新增：配置魔塔社区千问模型（替换原OpenAI配置，重点！）
@@ -65,13 +67,13 @@ client = OpenAI(
 
 
 # 根接口（保留）
-@app.get("/")
-def read_root():
-    return {"message": "Hello World! 欢迎学习大模型应用开发", "status": "success"}
+@app.get("/", description="根接口，用于测试服务是否正常启动", summary="服务健康检测接口")
+def root():
+    return {"message": "Hello World"}
 
 
 # 路径参数接口（保留）
-@app.get("/user/{user_id}")
+@app.get("/user/{user_id}", description="根据用户ID查询用户信息（测试接口），返回用户ID和用户名", summary="用户查询测试接口")
 def get_user(user_id: int):
     return {
         "status": "success",
@@ -83,26 +85,31 @@ def get_user(user_id: int):
 
 # 第3天定义的请求体模型（保留，无需修改，直接复用）
 class LLMQueryRequest(BaseModel):
-    question: str  # 必选字段，用户当前提问（核心参数）
-    user_id: int  # 必选字段，用户ID
-    history: list = []  # 可选字段，历史对话列表，默认空列表
-    model: str = "gpt-3.5-turbo"  # 可选字段，默认模型，不影响千问调用（可保留）
+    user_id: int = Query(..., description="用户ID，整数类型，必填")
+    question: str = Query(..., description="用户当前提问，字符串类型，必填，不可为空")
+    history: list = Query([], description="历史对话列表，默认空列表，每个元素需包含question（用户提问）和answer（助手回答）字段")
+    model: str = Query("Qwen/Qwen3.5-35B-A3B", description="模型ID，默认使用千问模型Qwen/Qwen3.5-35B-A3B")
 
 
 # 第3天定义的响应模型（保留，无需修改，规范返回格式）
 class LLMQueryResponse(BaseModel):
-    status: str = "success"
-    code: int = 200
-    user_id: int
-    question: str
-    history: list
-    model: str
-    answer: str
+    user_id: int = Query(..., description="用户ID，与请求参数一致")
+    question: str = Query(..., description="用户当前提问，与请求参数一致")
+    history: list = Query(..., description="完整的历史对话列表（包含当前提问和回答）")
+    model: str = Query(..., description="使用的模型ID")
+    answer: str = Query(..., description="千问模型的回答，若报错则返回错误提示")
+    status: str = Query(None, description="接口状态，success=成功，error=失败，可选")
+    code: int = Query(None, description="错误码，400=客户端错误，500=服务端错误，可选")
 
 
 # 修改：对接魔塔社区千问模型API的接口（替换第3天的/llm/query接口，适配你的代码）
-@app.post("/llm/query", response_model=LLMQueryResponse)
-def llm_query(request: LLMQueryRequest):
+# 修改：/llm/query接口，添加规范注释
+@app.post("/llm/query",
+          response_model=LLMQueryResponse,
+          description="千问模型调用接口，支持多轮对话，已优化长对话报错问题，返回模型回答及完整历史对话",
+          summary="千问模型多轮对话接口")
+
+def llm_query(request: LLMQueryRequest=Body(...,description="请求参数，包含用户ID、提问、历史对话、模型ID，历史对话需包含question和answer字段"),):
     try:
         # 边界情况1：空提问（客户端错误，code=400）
         if not request.question.strip():
@@ -132,21 +139,28 @@ def llm_query(request: LLMQueryRequest):
                 "answer": "【客户端错误】所有历史对话格式错误，需包含question和answer字段"
             }
 
+        # 新增：历史对话截断逻辑（衔接第5天的valid_history过滤）
+        # 设置最大历史对话轮次（可根据需求修改，建议3-5轮，避免过长）
+        MAX_HISTORY_ROUNDS = 3
+        # 截断历史对话：保留最近MAX_HISTORY_ROUNDS轮有效对话
+        truncated_history = valid_history[-MAX_HISTORY_ROUNDS:] if len(valid_history) > MAX_HISTORY_ROUNDS else valid_history
+
         # 调用封装函数
         model_response = call_qwen_model(
             question=request.question,
-            history=valid_history,
+            history=truncated_history,# 替换为截断后的历史对话
             token=QWEN_TOKEN
         )
 
         # 处理模型调用结果
         if model_response["status"] == "success":
-            new_history = valid_history.copy()
+            # 调用成功，更新完整的历史对话（不截断，前端显示全部）
+            new_history = valid_history.copy()  # 仍使用valid_history，保留完整对话
             new_history.append({"question": request.question, "answer": model_response["answer"]})
             return {
                 "user_id": request.user_id,
                 "question": request.question,
-                "history": new_history,
+                "history": new_history,  # 返回完整历史对话，便于前端展示
                 "model": request.model,
                 "answer": model_response["answer"]
             }
@@ -180,7 +194,7 @@ def llm_query(request: LLMQueryRequest):
 
 
 
-@app.get("/llm/test")
+@app.get("/llm/test", description="测试千问模型封装函数的可复用性，返回模型直接回答", summary="千问模型复用测试接口")
 def test_qwen():
     qwen_token = QWEN_TOKEN
     response = call_qwen_model(
